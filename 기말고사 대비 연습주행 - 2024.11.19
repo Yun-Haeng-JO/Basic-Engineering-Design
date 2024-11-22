@@ -1,62 +1,63 @@
 #include <MsTimer2.h>
 #include <LSM303.h>
 
-#define test_pin 45
-#define A0pin A0
-#define SIpin 23
-#define CLKpin 22
-#define NPIXELS 128
+#define sensor_pin 22    
+#define analog_pin A8     
+#define serial_pin 24     
+#define clock_pin 26      
+#define SENSOR_COUNT 128
 
-#define ENA 12
-#define IN1 8
-#define IN2 9
-#define IN3 10
-#define IN4 11
-#define ENB 13
 
-#define base_speed 100
-#define Grid_Size 0.4
+#define motor_enable_a 4  
+#define motor_in1 30      
+#define motor_in2 32      
+#define motor_in3 34      
+#define motor_in4 36      
+#define motor_enable_b 5  
 
-float target_heading_angle = 90;
-float kp_yaw = 0.21;
-float kd_yaw = 0.4;
-float error_yaw = 0.0;
-float error_yaw_old = 0.0;
-float pid_out;
-float target_yaw;
+#define default_speed 80
+#define cell_size 0.4
 
-LSM303 compass;
+float desired_angle = 90;
+float proportional_gain_heading = 0.35;
+float derivative_gain_heading = 0.25;
+float heading_error = 0.0;
+float prev_heading_error = 0.0;
+float controller_output;
+float desired_heading;
 
-byte Pixel[NPIXELS];
-byte Threshold_Data[NPIXELS];
+LSM303 imu;
 
-int LineSensor_Data[NPIXELS];
-int LineSensor_Data_Adaption[NPIXELS];
-int MAX_LineSensor_Data[NPIXELS];
-int MIN_LineSensor_Data[NPIXELS];
-int flag_line_adapation;
+byte sensor_values[SENSOR_COUNT];
+byte binary_threshold[SENSOR_COUNT];
 
-long encoder_A_pulse = 0;
-long encoder_B_pulse = 0;
-long prev_encoder_A = 0;
-long prev_encoder_B = 0;
+int raw_sensor_data[SENSOR_COUNT];
+int calibrated_sensor_data[SENSOR_COUNT];
+int max_sensor_values[SENSOR_COUNT];
+int min_sensor_values[SENSOR_COUNT];
+int calibration_status;
 
-const int IMG_WIDTH_HALF = 64;
-const int BASE_SPEED = 70;
-const float KP = 4.0;
-const float KD = 0.2;
-float error_old = 0.0;
+long left_encoder_count = 0;
+long right_encoder_count = 0;
+long prev_left_count = 0;
+long prev_right_count = 0;
+
+const int CAMERA_CENTER = 64;
+const int CRUISE_SPEED = 60;
+const float PROP_GAIN = 2.5;
+const float DERIV_GAIN = 0.15;
+float previous_error = 0.0;
 
 #define FASTADC 1
 #define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
 #define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
 
-float robot_distance = 0.0;
-float wheel_circumference = 20.0;
-int pulses_per_rev = 360;
+float travel_distance = 0.0;
+float wheel_perimeter = 21.0;
+int encoder_resolution = 400;
 
 int mission_flag = 0;
-int function_flag = 0;
+int control_mode = 0;
 
 struct Waypoint 
 {
@@ -64,30 +65,30 @@ struct Waypoint
   double heading_angle;
 };
 
-Waypoint waypoints[8];
+Waypoint waypoints[9];
 int waypoint_no = 0;
 
 void setup() 
 {
-  reset_encoder();               
-  reset_IMU();                   
-  MsTimer2::set(20, MsTimer2_ISR);
+  initialize_encoders();               
+  initialize_imu();                   
+  MsTimer2::set(20, timer_interrupt);
   MsTimer2::start();
 
-  for (int i = 0; i < NPIXELS; i++) 
+  for (int i = 0; i < SENSOR_COUNT; i++) 
   {
-    LineSensor_Data[i] = 0;
-    LineSensor_Data_Adaption[i] = 0;
-    MAX_LineSensor_Data[i] = 1023;
-    MIN_LineSensor_Data[i] = 0;
+    raw_sensor_data[i] = 0;
+    calibrated_sensor_data[i] = 0;
+    max_sensor_values[i] = 1023;
+    min_sensor_values[i] = 0;
   }
 
-  pinMode(SIpin, OUTPUT);
-  pinMode(CLKpin, OUTPUT);
-  pinMode(A0pin, INPUT);
+  pinMode(serial_pin, OUTPUT);
+  pinMode(clock_pin, OUTPUT);
+  pinMode(analog_pin, INPUT);
 
-  digitalWrite(SIpin, LOW);
-  digitalWrite(CLKpin, LOW);
+  digitalWrite(serial_pin, LOW);
+  digitalWrite(clock_pin, LOW);
 
 #if FASTADC
   sbi(ADCSRA, ADPS2);
@@ -95,211 +96,203 @@ void setup()
   cbi(ADCSRA, ADPS0);
 #endif
 
-  flag_line_adapation = 0;
+  calibration_status = 0;
 
-  pinMode(test_pin, OUTPUT);
+  pinMode(sensor_pin, OUTPUT);
 
   Serial.begin(115200);
 
   waypoints[0] = {0, 0};            
-  waypoints[1] = {2 * Grid_Size, 0};
+  waypoints[1] = {2 * cell_size, 0};
   waypoints[2] = {0, 90};  
-  waypoints[3] = {1 * Grid_Size, 0};  
-  waypoints[4] = {2 * Grid_Size, 0};
+  waypoints[3] = {1 * cell_size, 0};  
+  waypoints[4] = {2 * cell_size, 0};
   waypoints[5] = {0, 0};             
   waypoints[6] = {0, -90};         
-  waypoints[7] = {1 * Grid_Size, 0}; 
+  waypoints[7] = {1 * cell_size, 0}; 
   waypoints[8] = {0, -90};
 }
 
-
-void reset_encoder() 
+void initialize_encoders() 
 {
-  encoder_A_pulse = 0;
-  encoder_B_pulse = 0;
-  prev_encoder_A = 0;
-  prev_encoder_B = 0;
+  left_encoder_count = 0;
+  right_encoder_count = 0;
+  prev_left_count = 0;
+  prev_right_count = 0;
 }
 
-void MsTimer2_ISR() 
+void timer_interrupt() 
 {
-  switch (function_flag) 
+  switch (control_mode) 
   {
     case 1:
-      line_tracer();
+      follow_line();
       break;
     case 2:
-      yaw_control();
+      control_heading();
       break;
     case 3:
     default:
-      motor_control(0, 0);
+      set_motors(0, 0);
       break;
   }
 }
 
-void motor_l(int speed) 
+void set_left_motor(int speed) 
 {
   if (speed >= 0) 
   {
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, HIGH);
-    analogWrite(ENA, speed);
+    digitalWrite(motor_in1, LOW);
+    digitalWrite(motor_in2, HIGH);
+    analogWrite(motor_enable_a, speed);
   } 
   else 
   {
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-    analogWrite(ENA, -speed);
+    digitalWrite(motor_in1, HIGH);
+    digitalWrite(motor_in2, LOW);
+    analogWrite(motor_enable_a, -speed);
   }
 }
 
-void motor_r(int speed) 
+void set_right_motor(int speed) 
 {
   if (speed >= 0) 
   {
-    digitalWrite(IN3, LOW);
-    digitalWrite(IN4, HIGH);
-    analogWrite(ENB, speed);
+    digitalWrite(motor_in3, LOW);
+    digitalWrite(motor_in4, HIGH);
+    analogWrite(motor_enable_b, speed);
   } 
   else 
   {
-    digitalWrite(IN3, HIGH);
-    digitalWrite(IN4, LOW);
-    analogWrite(ENB, -speed);
+    digitalWrite(motor_in3, HIGH);
+    digitalWrite(motor_in4, LOW);
+    analogWrite(motor_enable_b, -speed);
   }
 }
 
-void motor_control(int left_motor_speed, int right_motor_speed) 
+void set_motors(int left_speed, int right_speed) 
 {
-  motor_l(left_motor_speed);
-  motor_r(right_motor_speed);
+  set_left_motor(left_speed);
+  set_right_motor(right_speed);
 }
 
-void reset_IMU() {
-  compass.init(); 
+void initialize_imu() {
+  imu.init(); 
   delay(100);     
-  compass.read(); 
-  Serial.println("IMU has been reset.");
+  imu.read(); 
+  Serial.println("IMU initialized.");
 }
 
-void read_line_camera(void)
+void read_line_sensors(void)
 {
   int i;
-  digitalWrite(CLKpin, LOW);
-  digitalWrite(SIpin, HIGH);
-  digitalWrite(CLKpin, HIGH);
-  digitalWrite(SIpin, LOW);
+  digitalWrite(clock_pin, LOW);
+  digitalWrite(serial_pin, HIGH);
+  digitalWrite(clock_pin, HIGH);
+  digitalWrite(serial_pin, LOW);
   delayMicroseconds(1);
 
-  for (i = 0; i < NPIXELS; i++)
+  for (i = 0; i < SENSOR_COUNT; i++)
   {
-    Pixel[i] = analogRead(A0pin) / 4;
-    digitalWrite(CLKpin, LOW);
+    sensor_values[i] = analogRead(analog_pin) / 4;
+    digitalWrite(clock_pin, LOW);
     delayMicroseconds(1);
-    digitalWrite(CLKpin, HIGH);
+    digitalWrite(clock_pin, HIGH);
   }
-  digitalWrite(CLKpin, LOW);
+  digitalWrite(clock_pin, LOW);
 }
 
-void update_robot_distance() 
+void update_position() 
 {
-  long delta_A = encoder_A_pulse - prev_encoder_A;
-  long delta_B = encoder_B_pulse - prev_encoder_B;
+  long delta_left = left_encoder_count - prev_left_count;
+  long delta_right = right_encoder_count - prev_right_count;
 
-  float avg_pulse = (delta_A + delta_B) / 2.0;
-  robot_distance += (avg_pulse / pulses_per_rev) * wheel_circumference;
+  float avg_ticks = (delta_left + delta_right) / 2.0;
+  travel_distance += (avg_ticks / encoder_resolution) * wheel_perimeter;
 
-  Serial.print("Distance: ");
-  Serial.println(robot_distance);
+  Serial.print("Position: ");
+  Serial.println(travel_distance);
 
-  prev_encoder_A = encoder_A_pulse;
-  prev_encoder_B = encoder_B_pulse;
+  prev_left_count = left_encoder_count;
+  prev_right_count = right_encoder_count;
 }
 
-
-void yaw_control() 
+void control_heading() 
 {
-  float error_yaw_d;
-  int l_motor_speed;
-  int r_motor_speed;
+  float heading_rate;
+  int left_speed;
+  int right_speed;
 
-  compass.read();
-  float heading_angle = compass.heading();
+  imu.read();
+  float current_heading = imu.heading();
 
-  error_yaw = target_yaw - heading_angle;
-  if (error_yaw > 180) error_yaw -= 360;
-  else if (error_yaw < -180) error_yaw += 360;
+  heading_error = desired_heading - current_heading;
+  if (heading_error > 180) heading_error -= 360;
+  else if (heading_error < -180) heading_error += 360;
 
-  error_yaw_d = error_yaw - error_yaw_old;
-  pid_out = kp_yaw * error_yaw + kd_yaw * error_yaw_d;
-  error_yaw_old = error_yaw;
+  heading_rate = heading_error - prev_heading_error;
+  controller_output = proportional_gain_heading * heading_error + derivative_gain_heading * heading_rate;
+  prev_heading_error = heading_error;
 
-  l_motor_speed = base_speed + (int)pid_out;
-  r_motor_speed = base_speed - (int)pid_out;
+  left_speed = default_speed + (int)controller_output;
+  right_speed = default_speed - (int)controller_output;
 
-  motor_control(l_motor_speed, r_motor_speed);
+  set_motors(left_speed, right_speed);
 }
 
-void threshold_line_image(int threshold_value)
+void apply_threshold(int threshold_value)
 {
-  digitalWrite(test_pin, HIGH);
-  for (int i = 0; i < NPIXELS; i++)
+  digitalWrite(sensor_pin, HIGH);
+  for (int i = 0; i < SENSOR_COUNT; i++)
   {
-    if (Pixel[i] >= threshold_value)
-    {
-      Threshold_Data[i] = 255;
-    } else {
-      Threshold_Data[i] = 0;
-    }
+    binary_threshold[i] = (sensor_values[i] >= threshold_value) ? 255 : 0;
   }
-  digitalWrite(test_pin, LOW);
+  digitalWrite(sensor_pin, LOW);
 }
 
-double line_COM(void)
+double calculate_centroid(void)
 {
-  double COM = 0.0;
-  double mass_sum = 0.0;
+  double weighted_sum = 0.0;
+  double total_mass = 0.0;
 
-  for (int i = 0; i < NPIXELS; i++)
+  for (int i = 0; i < SENSOR_COUNT; i++)
   {
-    mass_sum += Threshold_Data[i];
-    COM += Threshold_Data[i] * i;
+    total_mass += binary_threshold[i];
+    weighted_sum += binary_threshold[i] * i;
   }
 
-  if (mass_sum == 0)
+  if (total_mass == 0)
   {
     return -1;
   }
 
-  COM = COM / mass_sum;
-  return COM;
+  return weighted_sum / total_mass;
 }
 
-void line_control(int line_center)
+void track_line(int line_position)
 {
-  int error = line_center - IMG_WIDTH_HALF;
-  int derivative = error - error_old;
-  float output = KP * error + KD * derivative;
-  int speed_difference = int(output);
+  int position_error = line_position - CAMERA_CENTER;
+  int error_change = position_error - previous_error;
+  float control_signal = PROP_GAIN * position_error + DERIV_GAIN * error_change;
+  int speed_delta = int(control_signal);
 
-  int right_speed = BASE_SPEED - speed_difference;
-  int left_speed  = BASE_SPEED + speed_difference;
+  int right_speed = CRUISE_SPEED - speed_delta;
+  int left_speed  = CRUISE_SPEED + speed_delta;
 
   left_speed = constrain(left_speed, 0, 100);
   right_speed = constrain(right_speed, 0, 100);
 
-  motor_control(left_speed, right_speed);
-  error_old = error;
+  set_motors(left_speed, right_speed);
+  previous_error = position_error;
 }
 
-void line_tracer() 
+void follow_line() 
 {
-  double cx = 64;
-  read_line_camera();
-  threshold_line_image(150);
-  cx = line_COM();
-  line_control(cx);
+  double center_pos = 64;
+  read_line_sensors();
+  apply_threshold(150);
+  center_pos = calculate_centroid();
+  track_line(center_pos);
 }
 
 void loop()
@@ -307,48 +300,48 @@ void loop()
   switch (mission_flag)
   {
     case 0: 
-      motor_control(0, 0);
+      set_motors(0, 0);
       delay(500);
-      reset_encoder();
-      robot_distance = 0.0;
-      reset_IMU(); 
-      function_flag = 1; 
+      initialize_encoders();
+      travel_distance = 0.0;
+      initialize_imu(); 
+      control_mode = 1; 
       mission_flag = 1;
       break;
 
     case 1:
-      if (robot_distance >= waypoints[waypoint_no].distance)
+      if (travel_distance >= waypoints[waypoint_no].distance)
       {
-        function_flag = 3; 
+        control_mode = 3; 
         delay(500);
-        reset_IMU(); 
-        target_yaw = waypoints[waypoint_no].heading_angle; 
-        function_flag = 2; 
+        initialize_imu(); 
+        desired_heading = waypoints[waypoint_no].heading_angle + imu.heading(); 
+        control_mode = 2; 
         mission_flag = 2;
       }
       else
       {
-        line_tracer(); 
+        follow_line(); 
       }
       break;
 
     case 2: 
-      yaw_control(); 
-      if (abs(error_yaw) < 3) 
+      control_heading(); 
+      if (abs(heading_error) < 3) 
       {
-        function_flag = 3; 
+        control_mode = 3; 
         delay(500);
-        reset_encoder();
+        initialize_encoders();
         mission_flag = 3;
       }
       break;
 
     case 3: 
-      motor_control(0, 0);
+      set_motors(0, 0);
       delay(500);
-      reset_encoder();
-      robot_distance = 0.0;
-      reset_IMU(); 
+      initialize_encoders();
+      travel_distance = 0.0;
+      initialize_imu(); 
 
       waypoint_no++;
       if (waypoint_no < sizeof(waypoints) / sizeof(waypoints[0]))
@@ -362,7 +355,7 @@ void loop()
       break;
 
     case 4: 
-      motor_control(0, 0); 
+      set_motors(0, 0); 
       break;
   }
 }
